@@ -16,9 +16,10 @@ import os
 
 
 MAX_TIMESTAMP_DELTA = 5  # seconds between timestamps in log files
+ABSOLUTE_MAX_DELTA = 600  # 600 seconds as max timestamp delta
 
 USERACCOUNT_REGEX = re.compile(r'^(.*) - \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} - ')
-IPV4_REGEX = re.compile(r'.[^-] (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) - -')
+IPV4V6_REGEX = re.compile(r'''.[^-] (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) - -|.[^-] (.[a-f\d]*:.*) - -''')
 DATE_REGEX = re.compile(r'\[(\d{2}\/.{3}\/\d{4}:\d{2}:\d{2}:\d{2}) \+0200\]')
 HTTP_REQUEST_REGEX = re.compile(r':\d{2} \+0200\] "(.*?)"')
 PAYLOAD_REGEX = re.compile(r'HTTP\/1\.[0-1]" \d{3} ([\-\d]+) "')
@@ -148,9 +149,11 @@ class LogRecord():
         Looks for patterns matching regexp for a log line.
         """
         # Getting ip source address
-        ip_found = IPV4_REGEX.search(logline)
-        if ip_found:
+        ip_found = IPV4V6_REGEX.search(logline)
+        if ip_found and ip_found.group(1):
             self.ip_source = ip_found.group(1)
+        elif ip_found and ip_found.group(2):
+            self.ip_source = ip_found.group(2)
 
         # Getting date and timestamp
         date_found = DATE_REGEX.search(logline)
@@ -185,13 +188,19 @@ class LogRecord():
     def set_matched(self,):
         self.match_found = True
 
-    def has_logs_dates_match(self, other_record):
+    def has_logs_dates_match(self, other_record, max_timestamp_delta=None):
         delta = self.timestamp - other_record.timestamp
-        result = delta >= -2 and delta <= MAX_TIMESTAMP_DELTA
+        if not max_timestamp_delta:
+            result = delta >= -2 and delta <= MAX_TIMESTAMP_DELTA
+        else:
+            result = delta >= -2 and delta <= max_timestamp_delta
         return result
 
     def has_ips_match(self, other_record):
-        return self.ip_source == other_record.ip_source
+        if self.ip_source:
+            return self.ip_source == other_record.ip_source
+        else:
+            return False
 
     def has_requests_match(self, other_record):
         """
@@ -214,14 +223,16 @@ class LogRecord():
                       and other_record.payload == ('-' or '0')))
         return result
 
-    def has_partial_logs_match(self, other_record):
-        result = (self.has_logs_dates_match(other_record)
+    def has_partial_logs_match(self, other_record, max_timestamp_delta=None):
+        result = (self.has_logs_dates_match(other_record,
+                                            max_timestamp_delta)
                   and self.has_ips_match(other_record)
                   and self.has_requests_match(other_record))
         return result
 
-    def has_full_logs_match(self, other_record):
-        result = (self.has_partial_logs_match(other_record)
+    def has_full_logs_match(self, other_record, max_timestamp_delta=None):
+        result = (self.has_partial_logs_match(other_record,
+                                              max_timestamp_delta)
                   and self.has_statuscodes_match(other_record)
                   and self.has_payloads_match(other_record))
         return result
@@ -296,12 +307,51 @@ def lookup_log(log_filename, data_bucket, user_account=None, status_code=None):
     return error_lines
 
 
+def check_match(logline, lines_list,
+                same_lines, payload_delta, statuscode_delta,
+                max_timestamp_delta=None, check_nomatch=False):
+    """
+    Checks if there is a match between two log lines.
+
+    Returns None if there's a macth in lines_list.
+    Returns max_timestamp_delta incremented by 10
+    only if check_nomatch is set to True
+    and if there's no match in lines_list.
+    """
+    increment = 20  # 20 seconds of increment
+
+    for error_line in lines_list:
+        if error_line.match_found:
+            continue
+
+        if error_line.has_full_logs_match(logline,
+                                          max_timestamp_delta):
+            same_lines.append((error_line, logline.line))
+            error_line.set_matched()
+            logline.set_matched()
+            return
+
+        elif error_line.has_partial_logs_match(logline,
+                                               max_timestamp_delta):
+            if (error_line.has_statuscodes_match(logline)
+                    and not error_line.has_payloads_match(logline)):
+                payload_delta.append((error_line, logline.line))
+            elif not error_line.has_statuscodes_match(logline):
+                statuscode_delta.append((error_line,
+                                         logline.line))
+            error_line.set_matched()
+            logline.set_matched()
+            return
+    else:
+        if check_nomatch and max_timestamp_delta:
+            return increment
+
+
 def compare_logs(log_filename, error_lines, status_code):
     """
     Compares timestamp from log file to a list of lines with HTTP error.
     """
-    count = 0
-    lines_found = error_lines[:]
+    max_timestamp_delta = MAX_TIMESTAMP_DELTA
     apache_lines = []
     same_lines = []
     payload_delta = []
@@ -324,28 +374,42 @@ def compare_logs(log_filename, error_lines, status_code):
 
             apache_lines.append(apache_logline)
 
-            for error_line in error_lines:
-                if error_line.match_found:
-                    continue
-
-                if error_line.has_full_logs_match(apache_logline):
-                    same_lines.append((error_line, apache_logline.line))
-                    error_line.set_matched()
-                    apache_logline.set_matched
-
-                elif error_line.has_partial_logs_match(apache_logline):
-                    if (error_line.has_statuscodes_match(apache_logline)
-                            and not error_line.has_payloads_match(apache_logline)):
-                        payload_delta.append((error_line, apache_logline.line))
-                    elif error_line.has_statuscodes_match(apache_logline):
-                        statuscode_delta.append((error_line,
-                                                 apache_logline.line))
-
-                    error_line.set_matched()
-                    apache_logline.set_matched()
+            check_match(apache_logline,
+                        error_lines,
+                        same_lines,
+                        payload_delta,
+                        statuscode_delta)
 
     # Get remaining log lines
     nomatch_lines = [line for line in error_lines if not line.match_found]
+    apache_lines = [line for line in apache_lines if not line.match_found]
+
+    if nomatch_lines:
+        increment = 0
+        # Trying to retrieve line not matched
+        while max_timestamp_delta < ABSOLUTE_MAX_DELTA:
+            for logline in apache_lines:
+                increment = check_match(logline,
+                                        nomatch_lines,
+                                        same_lines,
+                                        payload_delta,
+                                        statuscode_delta,
+                                        max_timestamp_delta,
+                                        check_nomatch=True)
+            if increment:
+                # Soft increment
+                max_timestamp_delta += increment
+            else:
+                # Hard increment
+                max_timestamp_delta += max_timestamp_delta
+            match_found_state = [line.match_found for line in nomatch_lines]
+            if False not in match_found_state:
+                nomatch_lines = []
+                break
+        else:
+            nomatch_lines = [line for line in error_lines if not line.match_found]
+        apache_lines = [line for line in apache_lines if not line.match_found]
+
     print('DONE')
 
     return (same_lines,
@@ -467,10 +531,11 @@ def make_summary(same_lines,
                      verbose=True)
 
     # No match section
-    if nomatch_lines:
+    if nomatch_lines or apache_lines:
         print(separator1, nomatch_section, separator1, sep='\n')
         print(no_lines_subsect,
-              ' Total = ', len(nomatch_lines),
+              ' Total_alproxy = ', len(nomatch_lines),
+              ' Total_apache = ', len(apache_lines),
               '\n', separator4, '\n', separator4,
               sep='')
         print(alproxy_line_message)
